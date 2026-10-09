@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -17,17 +18,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"go.keploy.io/server/v3/pkg/agent/token"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/errdefs"
+	"github.com/klauspost/compress/zstd"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"go.keploy.io/server/v3/config"
 	"go.keploy.io/server/v3/pkg"
@@ -35,6 +41,7 @@ import (
 	"go.keploy.io/server/v3/pkg/client/app"
 	"go.keploy.io/server/v3/pkg/models"
 	kdocker "go.keploy.io/server/v3/pkg/platform/docker"
+	"go.keploy.io/server/v3/pkg/platform/engine"
 	agentUtils "go.keploy.io/server/v3/pkg/platform/http/utils"
 	"go.keploy.io/server/v3/pkg/service/agent"
 	"go.keploy.io/server/v3/utils"
@@ -52,11 +59,15 @@ type AgentClient struct {
 	dockerClient kdocker.Client //embedding the docker client to transfer the docker client methods to the core object
 	apps         sync.Map
 	client       http.Client
-	conf         *config.Config
-	agentCmd     *exec.Cmd             // Track the agent process
-	agentPTY     *agentUtils.PTYHandle // Track the PTY handle for interactive commands
-	mu           sync.Mutex
-	agentCancel  context.CancelFunc // Function to cancel the agent context
+	// hookClient serves the /hooks/* calls, which want a request deadline.
+	// Built here, not at the call sites, so it carries the bearer token like
+	// every other request to the agent.
+	hookClient  http.Client
+	conf        *config.Config
+	agentCmd    *exec.Cmd             // Track the agent process
+	agentPTY    *agentUtils.PTYHandle // Track the PTY handle for interactive commands
+	mu          sync.Mutex
+	agentCancel context.CancelFunc // Function to cancel the agent context
 	// --from-container only. The user's own container is stopped for the
 	// duration of the session, so SOMETHING has to start it again on every way
 	// out. restoreOnce makes that safe to call from each of them.
@@ -71,6 +82,21 @@ type AgentClient struct {
 	// re-creating it - which needs all of this.
 	fromContainerSpec        *sourceContainerSpec
 	restoreFromContainerOnce sync.Once
+
+	// consumedPerTest holds what the agent's last /updatemockparams answer said
+	// about how it reads the consumed history (models.ConsumedScopeHeader).
+	// StoreMocks clears it: a store addresses an agent, possibly a fresh one,
+	// whose answer this client has not seen yet.
+	consumedPerTest atomic.Bool
+}
+
+// AgentReadsConsumedPerTestOnly reports whether the agent's last
+// /updatemockparams answer said it reads the consumed history only for the
+// per-test mocks it stages (models.ConsumedScopePerTest). Until an answer has
+// said so, and again after every StoreMocks, it is false and the whole history
+// must be sent.
+func (a *AgentClient) AgentReadsConsumedPerTestOnly() bool {
+	return a.consumedPerTest.Load()
 }
 
 // var initStopScript []byte
@@ -80,7 +106,8 @@ func New(logger *zap.Logger, client kdocker.Client, c *config.Config) *AgentClie
 	return &AgentClient{
 		logger:       logger,
 		dockerClient: client,
-		client:       http.Client{},
+		client:       agentHTTPClient(token.Session()),
+		hookClient:   agentHTTPClientWithTimeout(token.Session(), agentHookTimeout),
 		conf:         c,
 	}
 }
@@ -106,175 +133,206 @@ func (a *AgentClient) GetIncoming(ctx context.Context, opts models.IncomingOptio
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// Make the HTTP request
-	res, err := a.client.Do(req)
+	// Registered before it connects; it outlives a restarted agent (see
+	// agentSession).
+	stream := a.session().openStream()
+	conn := stream.connect(ctx)
+	res, err := a.client.Do(req.WithContext(conn.ctx))
 	if err != nil {
+		stream.close()
 		return nil, fmt.Errorf("failed to get incoming: %s", err.Error())
 	}
 	if err := agentStreamStatus("get incoming", res); err != nil {
+		stream.close()
 		return nil, err
 	}
+	res.Body = conn.body(res.Body)
 
 	// Create a channel to stream TestCase data
 	tcChan := make(chan *models.TestCase)
 
-	// Determine stream type
+	// The first response's framing is checked here, where it can still fail
+	// the call; see readIncoming for the rest.
+	if mediaType, params, err := mime.ParseMediaType(res.Header.Get("Content-Type")); err == nil &&
+		strings.HasPrefix(mediaType, "multipart/") && strings.TrimSpace(params["boundary"]) == "" {
+		stream.close()
+		if res.Body != nil {
+			res.Body.Close()
+		}
+		return nil, fmt.Errorf("missing multipart boundary in content-type: %s", res.Header.Get("Content-Type"))
+	}
+
+	go func() {
+		defer func() {
+			close(tcChan)
+			stream.close()
+		}()
+		for {
+			done := a.readIncoming(ctx, res, tcChan)
+			if res.Body != nil {
+				if err := res.Body.Close(); err != nil {
+					utils.LogError(a.logger, err, "failed to close response body for incoming request")
+				}
+			}
+			if done {
+				return
+			}
+			var ok bool
+			if res, ok = a.resumeStream(ctx, stream, "get incoming", http.MethodPost, "/incoming", requestJSON); !ok {
+				return
+			}
+		}
+	}()
+
+	a.logger.Debug("Successfully connected to incoming test cases stream.")
+	return tcChan, nil
+}
+
+// readIncoming hands the test cases of one incoming stream to tcChan until the
+// stream ends, in the stream's framing (multipart, or a legacy JSON stream).
+// It reports whether the stream must not go on: ctx is done, or the response
+// cannot be read at all.
+func (a *AgentClient) readIncoming(ctx context.Context, res *http.Response, tcChan chan<- *models.TestCase) (done bool) {
 	contentType := res.Header.Get("Content-Type")
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		utils.LogError(a.logger, err, "failed to parse content type", zap.String("content-type", contentType))
 	}
-
 	if strings.HasPrefix(mediaType, "multipart/") {
 		boundary := strings.TrimSpace(params["boundary"])
 		if boundary == "" {
-			if res.Body != nil {
-				res.Body.Close()
-			}
-			return nil, fmt.Errorf("missing multipart boundary in content-type: %s", contentType)
+			utils.LogError(a.logger, nil, "missing multipart boundary in content-type", zap.String("content-type", contentType))
+			return true
 		}
-		go func() {
-			defer func() {
-				close(tcChan)
-				if res.Body != nil {
-					res.Body.Close()
-				}
-			}()
+		return a.readIncomingParts(ctx, res, boundary, tcChan)
+	}
+	return a.readIncomingJSON(ctx, res, tcChan)
+}
 
-			mr := multipart.NewReader(res.Body, boundary)
-			var pendingTestCase *models.TestCase
+// readIncomingParts reads a multipart incoming stream; see readIncoming.
+func (a *AgentClient) readIncomingParts(ctx context.Context, res *http.Response, boundary string, tcChan chan<- *models.TestCase) (done bool) {
+	mr := multipart.NewReader(res.Body, boundary)
+	var pendingTestCase *models.TestCase
 
-			for {
-				part, err := mr.NextPart()
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					if ctx.Err() != nil ||
-						strings.Contains(err.Error(), "closed network connection") ||
-						errors.Is(err, io.ErrUnexpectedEOF) ||
-						strings.Contains(err.Error(), "unexpected EOF") {
-						a.logger.Debug("multipart stream ended", zap.Error(err))
-						break
-					}
-					utils.LogError(a.logger, err, "error reading stream part")
-					break
-				}
-
-				if part.FormName() == "metadata" {
-					var tc models.TestCase
-					if err := json.NewDecoder(part).Decode(&tc); err != nil {
-						utils.LogError(a.logger, err, "failed to decode metadata json")
-						continue
-					}
-					if tc.HasBinaryFile {
-						pendingTestCase = &tc
-					} else {
-						select {
-						case <-ctx.Done():
-							return
-						case tcChan <- &tc:
-							pendingTestCase = nil
-						}
-					}
-				} else if part.FormName() == "file" {
-					if pendingTestCase == nil {
-						utils.LogError(a.logger, nil, "Received file part without preceding metadata, skipping...")
-						continue
-					}
-					fileName := part.FileName()
-					sanitizedFileName := filepath.Base(fileName)
-					if sanitizedFileName == "." || sanitizedFileName == string(filepath.Separator) || sanitizedFileName == "" {
-						sanitizedFileName = "testcase_blob"
-					}
-					a.logger.Debug("Received binary file part", zap.String("file_name", fileName), zap.String("sanitized_name", sanitizedFileName))
-
-					savePath := filepath.Join(os.TempDir(), fmt.Sprintf("keploy_%d_%s", time.Now().UnixNano(), sanitizedFileName))
-					outFile, err := os.Create(savePath)
-					if err != nil {
-						utils.LogError(a.logger, err, "failed to create temp file for stream")
-						continue
-					}
-
-					_, err = io.Copy(outFile, part)
-					outFile.Close()
-					if err != nil {
-						utils.LogError(a.logger, err, "failed to write file stream to disk")
-						continue
-					}
-					a.logger.Debug("Successfully wrote binary file to temp storage", zap.String("path", savePath))
-					// Link matching file path logic
-					updated := false
-					for i := range pendingTestCase.HTTPReq.Form {
-						form := &pendingTestCase.HTTPReq.Form[i]
-						for j, fname := range form.FileNames {
-							if (fname == fileName || fname == sanitizedFileName || filepath.Base(fname) == sanitizedFileName) && j < len(form.Paths) {
-								form.Paths[j] = savePath
-								updated = true
-							}
-						}
-					}
-					if !updated {
-						for i := range pendingTestCase.HTTPReq.Form {
-							form := &pendingTestCase.HTTPReq.Form[i]
-							if len(form.Paths) > 0 {
-								form.Paths[0] = savePath
-								break
-							}
-						}
-					}
-
-				} else if part.FormName() == "delimiter" {
-					if pendingTestCase == nil {
-						continue
-					}
-					select {
-					case <-ctx.Done():
-						return
-					case tcChan <- pendingTestCase:
-						pendingTestCase = nil
-					}
-				}
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			if ctx.Err() != nil ||
+				strings.Contains(err.Error(), "closed network connection") ||
+				errors.Is(err, io.ErrUnexpectedEOF) ||
+				strings.Contains(err.Error(), "unexpected EOF") {
+				a.logger.Debug("multipart stream ended", zap.Error(err))
+				break
 			}
-		}()
-	} else {
-		// Legacy JSON stream
-		go func() {
-			defer func() {
-				close(tcChan)
+			utils.LogError(a.logger, err, "error reading stream part")
+			break
+		}
 
-				err := res.Body.Close()
-				if err != nil {
-					utils.LogError(a.logger, err, "failed to close response body for incoming request")
-				}
-			}()
-
-			decoder := json.NewDecoder(res.Body)
-
-			for {
-				var testCase models.TestCase
-				if err := decoder.Decode(&testCase); err != nil {
-					if utils.IsShutdownError(err) {
-						// End of the stream or connection closed during shutdown
-						break
-					}
-					utils.LogError(a.logger, err, "failed to decode test case from stream")
-					break
-				}
-
+		if part.FormName() == "metadata" {
+			var tc models.TestCase
+			if err := json.NewDecoder(part).Decode(&tc); err != nil {
+				utils.LogError(a.logger, err, "failed to decode metadata json")
+				continue
+			}
+			if tc.HasBinaryFile {
+				pendingTestCase = &tc
+			} else {
 				select {
 				case <-ctx.Done():
-					// If the context is done, exit the loop
-					return
-				case tcChan <- &testCase:
-					// Send the decoded test case to the channel
+					return true
+				case tcChan <- &tc:
+					pendingTestCase = nil
 				}
 			}
-		}()
-	}
+		} else if part.FormName() == "file" {
+			if pendingTestCase == nil {
+				utils.LogError(a.logger, nil, "Received file part without preceding metadata, skipping...")
+				continue
+			}
+			fileName := part.FileName()
+			sanitizedFileName := filepath.Base(fileName)
+			if sanitizedFileName == "." || sanitizedFileName == string(filepath.Separator) || sanitizedFileName == "" {
+				sanitizedFileName = "testcase_blob"
+			}
+			a.logger.Debug("Received binary file part", zap.String("file_name", fileName), zap.String("sanitized_name", sanitizedFileName))
 
-	a.logger.Debug("Successfully connected to incoming test cases stream.")
-	return tcChan, nil
+			savePath := filepath.Join(os.TempDir(), fmt.Sprintf("keploy_%d_%s", time.Now().UnixNano(), sanitizedFileName))
+			outFile, err := os.Create(savePath)
+			if err != nil {
+				utils.LogError(a.logger, err, "failed to create temp file for stream")
+				continue
+			}
+
+			_, err = io.Copy(outFile, part)
+			outFile.Close()
+			if err != nil {
+				utils.LogError(a.logger, err, "failed to write file stream to disk")
+				continue
+			}
+			a.logger.Debug("Successfully wrote binary file to temp storage", zap.String("path", savePath))
+			// Link matching file path logic
+			updated := false
+			for i := range pendingTestCase.HTTPReq.Form {
+				form := &pendingTestCase.HTTPReq.Form[i]
+				for j, fname := range form.FileNames {
+					if (fname == fileName || fname == sanitizedFileName || filepath.Base(fname) == sanitizedFileName) && j < len(form.Paths) {
+						form.Paths[j] = savePath
+						updated = true
+					}
+				}
+			}
+			if !updated {
+				for i := range pendingTestCase.HTTPReq.Form {
+					form := &pendingTestCase.HTTPReq.Form[i]
+					if len(form.Paths) > 0 {
+						form.Paths[0] = savePath
+						break
+					}
+				}
+			}
+
+		} else if part.FormName() == "delimiter" {
+			if pendingTestCase == nil {
+				continue
+			}
+			select {
+			case <-ctx.Done():
+				return true
+			case tcChan <- pendingTestCase:
+				pendingTestCase = nil
+			}
+		}
+	}
+	return false
+}
+
+// readIncomingJSON reads a legacy JSON incoming stream; see readIncoming.
+func (a *AgentClient) readIncomingJSON(ctx context.Context, res *http.Response, tcChan chan<- *models.TestCase) (done bool) {
+	decoder := json.NewDecoder(res.Body)
+
+	for {
+		var testCase models.TestCase
+		if err := decoder.Decode(&testCase); err != nil {
+			if utils.IsShutdownError(err) {
+				// End of the stream or connection closed during shutdown
+				break
+			}
+			utils.LogError(a.logger, err, "failed to decode test case from stream")
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			// If the context is done, exit the loop
+			return true
+		case tcChan <- &testCase:
+			// Send the decoded test case to the channel
+		}
+	}
+	return false
 }
 
 // mockHandoffBuffer sizes the decoder -> consumer hand-off. Deep enough that a
@@ -328,14 +386,20 @@ func (a *AgentClient) GetOutgoing(ctx context.Context, opts models.OutgoingOptio
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// Make the HTTP request
-	res, err := a.client.Do(req)
+	// Registered before it connects; it outlives a restarted agent (see
+	// agentSession).
+	stream := a.session().openStream()
+	conn := stream.connect(ctx)
+	res, err := a.client.Do(req.WithContext(conn.ctx))
 	if err != nil {
+		stream.close()
 		return nil, fmt.Errorf("failed to get outgoing response: %s", err.Error())
 	}
 	if err := agentStreamStatus("get outgoing", res); err != nil {
+		stream.close()
 		return nil, err
 	}
+	res.Body = conn.body(res.Body)
 
 	// Buffered. An unbuffered channel parks the decoder for as long as the
 	// consumer spends inside InsertMock - and the first insert does mkdir +
@@ -346,64 +410,79 @@ func (a *AgentClient) GetOutgoing(ctx context.Context, opts models.OutgoingOptio
 
 	grp, ok := ctx.Value(models.ErrGroupKey).(*errgroup.Group)
 	if !ok {
+		stream.close()
+		_ = res.Body.Close()
 		return nil, fmt.Errorf("failed to get errorgroup from the context")
 	}
 
 	grp.Go(func() error {
 		defer func() {
 			close(mockChan)
-
-			err := res.Body.Close()
-			if err != nil {
+			stream.close()
+		}()
+		for {
+			dropped := a.readMocks(res, mockChan)
+			if err := res.Body.Close(); err != nil {
 				utils.LogError(a.logger, err, "failed to close response body for getoutgoing")
 			}
-		}()
-
-		decoder := gob.NewDecoder(res.Body)
-
-		for {
-			var mock models.Mock
-			if err := decoder.Decode(&mock); err != nil {
-				if utils.IsShutdownError(err) {
-					// End of the stream or connection closed during shutdown
-					break
-				}
-				utils.LogError(a.logger, err, "failed to decode mock from stream")
-				break
+			if dropped {
+				return nil
 			}
-
-			// Offer the mock rather than racing the context for it.
-			//
-			// This used to be `select { case <-ctx.Done(): return nil; case
-			// mockChan <- &mock }`, which threw away a mock already decoded
-			// into our own address space the moment the capture context was
-			// cancelled - silently, with agent-side accounting still reporting
-			// success. Cancellation is the wrong thing to consult here: the
-			// consumer persists on an uncancellable context, so it can always
-			// accept, and the only reason it might not have yet is that it is
-			// busy writing the previous mock.
-			//
-			// So always try to deliver, bounded so a genuinely dead consumer
-			// cannot hang the stream. Anything still dropped is data loss and
-			// is logged as an error, because the alternative - a mock set
-			// indistinguishable from one where the call never happened - is
-			// what made this class of bug take an investigation to find.
-			select {
-			case mockChan <- &mock:
-				// Send the decoded mock to the channel
-			case <-time.After(mockHandoffGrace):
-				utils.LogError(a.logger, nil, "dropping a decoded mock: the consumer did not accept it in time",
-					zap.String("mock", mock.Name), zap.String("kind", string(mock.Kind)),
-					zap.Duration("waited", mockHandoffGrace))
+			var ok bool
+			if res, ok = a.resumeStream(ctx, stream, "get outgoing", http.MethodPost, "/outgoing", requestJSON); !ok {
 				return nil
 			}
 		}
-		return nil
 	})
 
 	a.logger.Debug("Successfully connected to outgoing mocks stream.")
 
 	return mockChan, nil
+}
+
+// readMocks hands the mocks of one outgoing stream to mockChan until the
+// stream ends. It reports whether it dropped one because the consumer stopped
+// taking them, after which the stream must not go on.
+func (a *AgentClient) readMocks(res *http.Response, mockChan chan<- *models.Mock) (dropped bool) {
+	decoder := gob.NewDecoder(res.Body)
+	for {
+		var mock models.Mock
+		if err := decoder.Decode(&mock); err != nil {
+			if utils.IsShutdownError(err) {
+				// End of the stream or connection closed during shutdown
+				break
+			}
+			utils.LogError(a.logger, err, "failed to decode mock from stream")
+			break
+		}
+
+		// Offer the mock rather than racing the context for it.
+		//
+		// This used to be `select { case <-ctx.Done(): return nil; case
+		// mockChan <- &mock }`, which threw away a mock already decoded
+		// into our own address space the moment the capture context was
+		// cancelled - silently, with agent-side accounting still reporting
+		// success. Cancellation is the wrong thing to consult here: the
+		// consumer persists on an uncancellable context, so it can always
+		// accept, and the only reason it might not have yet is that it is
+		// busy writing the previous mock.
+		//
+		// So always try to deliver, bounded so a genuinely dead consumer
+		// cannot hang the stream. Anything still dropped is data loss and
+		// is logged as an error, because the alternative - a mock set
+		// indistinguishable from one where the call never happened - is
+		// what made this class of bug take an investigation to find.
+		select {
+		case mockChan <- &mock:
+			// Send the decoded mock to the channel
+		case <-time.After(mockHandoffGrace):
+			utils.LogError(a.logger, nil, "dropping a decoded mock: the consumer did not accept it in time",
+				zap.String("mock", mock.Name), zap.String("kind", string(mock.Kind)),
+				zap.Duration("waited", mockHandoffGrace))
+			return true
+		}
+	}
+	return false
 }
 
 func (a *AgentClient) GetMappings(ctx context.Context, opts models.IncomingOptions) (<-chan models.TestMockMapping, error) {
@@ -417,9 +496,13 @@ func (a *AgentClient) GetMappings(ctx context.Context, opts models.IncomingOptio
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// Make the HTTP request
-	res, err := a.client.Do(req)
+	// Registered before it connects; it outlives a restarted agent (see
+	// agentSession).
+	stream := a.session().openStream()
+	conn := stream.connect(ctx)
+	res, err := a.client.Do(req.WithContext(conn.ctx))
 	if err != nil {
+		stream.close()
 		return nil, fmt.Errorf("failed to get mappings response: %s", err.Error())
 	}
 	// An agent predating test-mock mapping (keploy #3715, Feb 2026) has no
@@ -438,6 +521,7 @@ func (a *AgentClient) GetMappings(ctx context.Context, opts models.IncomingOptio
 	// an edge case. /incoming and /outgoing need no such guard — both routes
 	// predate #3016 and every agent that can serve a session has them.
 	if res.StatusCode == http.StatusNotFound {
+		stream.close()
 		if closeErr := res.Body.Close(); closeErr != nil {
 			utils.LogError(a.logger, closeErr, "failed to close response body for getmappings")
 		}
@@ -449,50 +533,71 @@ func (a *AgentClient) GetMappings(ctx context.Context, opts models.IncomingOptio
 		return noMappings, nil
 	}
 	if err := agentStreamStatus("get mappings", res); err != nil {
+		stream.close()
 		return nil, err
 	}
+	res.Body = conn.body(res.Body)
 
 	mappingChan := make(chan models.TestMockMapping)
 
 	grp, ok := ctx.Value(models.ErrGroupKey).(*errgroup.Group)
 	if !ok {
+		stream.close()
+		_ = res.Body.Close()
 		return nil, fmt.Errorf("failed to get errorgroup from the context")
 	}
 
 	grp.Go(func() error {
 		defer func() {
 			close(mappingChan)
+			stream.close()
+		}()
+		for {
+			done := a.readMappings(ctx, res, mappingChan)
 			if err := res.Body.Close(); err != nil {
 				utils.LogError(a.logger, err, "failed to close response body for getmappings")
 			}
-		}()
-
-		decoder := json.NewDecoder(res.Body)
-
-		for {
-			var mapping models.TestMockMapping
-			if err := decoder.Decode(&mapping); err != nil {
-				if utils.IsShutdownError(err) {
-					break
-				}
-				utils.LogError(a.logger, err, "failed to decode mapping from stream")
-				break
-			}
-
-			select {
-			case <-ctx.Done():
+			if done {
 				return nil
-			case mappingChan <- mapping:
+			}
+			var ok bool
+			if res, ok = a.resumeStream(ctx, stream, "get mappings", http.MethodPost, "/mappings", nil); !ok {
+				return nil
 			}
 		}
-		return nil
 	})
 
 	a.logger.Debug("Successfully connected to mappings stream.")
 	return mappingChan, nil
 }
 
-func (a *AgentClient) MockOutgoing(ctx context.Context, opts models.OutgoingOptions) error {
+// readMappings hands the mappings of one mappings stream to mappingChan until
+// the stream ends. It reports whether ctx is done, after which the stream must
+// not go on.
+func (a *AgentClient) readMappings(ctx context.Context, res *http.Response, mappingChan chan<- models.TestMockMapping) (done bool) {
+	decoder := json.NewDecoder(res.Body)
+	for {
+		var mapping models.TestMockMapping
+		if err := decoder.Decode(&mapping); err != nil {
+			if !utils.IsShutdownError(err) {
+				utils.LogError(a.logger, err, "failed to decode mapping from stream")
+			}
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return true
+		case mappingChan <- mapping:
+		}
+	}
+}
+
+func (a *AgentClient) MockOutgoing(ctx context.Context, opts models.OutgoingOptions) (retErr error) {
+	defer func() {
+		if retErr == nil && a.session().recording() {
+			a.session().record(stepMockOutgoing, func(c context.Context) error { return a.MockOutgoing(c, opts) })
+		}
+	}()
 
 	// See GetOutgoing: mirror both spellings before the marshal so a pre-rename
 	// agent still sees the toggle.
@@ -646,8 +751,7 @@ func (a *AgentClient) BeforeSimulate(ctx context.Context, timestamp *time.Time, 
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 50 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := a.hookClient.Do(req)
 	if err != nil {
 		a.logger.Debug("failed to call agent hook", zap.String("endpoint", "/hooks/before-simulate"), zap.Error(err))
 		return nil
@@ -682,8 +786,7 @@ func (a *AgentClient) AfterSimulate(ctx context.Context, tcName string, testSetI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 50 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := a.hookClient.Do(req)
 	if err != nil {
 		a.logger.Debug("failed to call agent hook", zap.String("endpoint", "/hooks/after-simulate"), zap.Error(err))
 		return nil
@@ -717,8 +820,7 @@ func (a *AgentClient) BeforeTestRun(ctx context.Context, testRunID string) error
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 50 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := a.hookClient.Do(req)
 	if err != nil {
 		a.logger.Debug("failed to call agent hook", zap.String("endpoint", "/hooks/before-test-run"), zap.Error(err))
 		return nil
@@ -733,7 +835,15 @@ func (a *AgentClient) BeforeTestRun(ctx context.Context, testRunID string) error
 
 }
 
-func (a *AgentClient) BeforeTestSetCompose(ctx context.Context, testRunID string, testSetID string, firstRun bool) error {
+func (a *AgentClient) BeforeTestSetCompose(ctx context.Context, testRunID string, testSetID string, firstRun bool) (retErr error) {
+	defer func() {
+		// Made again on a restarted agent, it is no first run: what a
+		// first run cleans up was cleaned up (see replay's repair, which
+		// re-registers the same way).
+		if retErr == nil && a.session().recording() {
+			a.session().record(stepTestSetHook, func(c context.Context) error { return a.BeforeTestSetCompose(c, testRunID, testSetID, false) })
+		}
+	}()
 
 	requestBody := models.BeforeTestSetCompose{
 		TestRunID: testRunID,
@@ -754,8 +864,7 @@ func (a *AgentClient) BeforeTestSetCompose(ctx context.Context, testRunID string
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 50 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := a.hookClient.Do(req)
 	if err != nil {
 		a.logger.Debug("failed to call agent hook", zap.String("endpoint", "/hooks/before-test-set-compose"), zap.Error(err))
 		return nil
@@ -792,8 +901,7 @@ func (a *AgentClient) AfterTestRun(ctx context.Context, testRunID string, testSe
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 50 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := a.hookClient.Do(req)
 	if err != nil {
 		a.logger.Debug("failed to call agent hook", zap.String("endpoint", "/hooks/after-test-run"), zap.Error(err))
 		return nil
@@ -823,14 +931,26 @@ func (a *AgentClient) AfterTestRun(ctx context.Context, testRunID string, testSe
 // to reject the stream is old enough to have handled single-shot before — and
 // predates the large-corpus recordings streaming exists for — so the fallback
 // is safe; a genuine bad-request 400 simply fails again on the retry.
-func (a *AgentClient) StoreMocks(ctx context.Context, filtered []*models.Mock, unFiltered []*models.Mock) error {
+func (a *AgentClient) StoreMocks(ctx context.Context, filtered []*models.Mock, unFiltered []*models.Mock) (retErr error) {
+	// The callers strip what the agent does not hold (models.AgentBound) at
+	// the source, so their counts agree with what is sent; this is the same
+	// rule again, for a caller that did not.
+	filtered, unFiltered = models.AgentBound(filtered), models.AgentBound(unFiltered)
+	defer func() {
+		if retErr == nil {
+			a.session().record(stepStoreMocks, func(c context.Context) error { return a.StoreMocks(c, filtered, unFiltered) })
+		}
+	}()
+	a.consumedPerTest.Store(false)
 	// A dedicated cancelable context for the stream request: cancelling it tears
 	// down the transport's read of the io.Pipe body, which unblocks the encoder
 	// goroutine's pw.Write if the agent responded (e.g. 400) before consuming the
 	// whole stream — so the fallback path can't leak that goroutine.
 	streamCtx, cancelStream := context.WithCancel(ctx)
 
-	res, err := a.storeMocksStream(streamCtx, filtered, unFiltered)
+	encoding := a.storeMocksEncoding(ctx)
+	start := time.Now()
+	res, sent, err := a.storeMocksStream(streamCtx, filtered, unFiltered, encoding)
 	if err != nil {
 		cancelStream()
 		return err
@@ -846,21 +966,138 @@ func (a *AgentClient) StoreMocks(ctx context.Context, filtered []*models.Mock, u
 
 	defer cancelStream()
 	defer res.Body.Close()
-	return decodeStoreMocksResp(res)
+	if err := decodeStoreMocksResp(res); err != nil {
+		return err
+	}
+	a.logger.Info("stored the mocks on the agent",
+		zap.Int("mocks", len(filtered)+len(unFiltered)),
+		zap.Int64("bytes", sent.raw.Load()),
+		zap.Int64("sentBytes", sent.wire.Load()),
+		zap.String("encoding", encodingName(encoding)),
+		zap.Duration("took", time.Since(start)))
+	return nil
+}
+
+// storeMocksEncodingProbeTimeout bounds the /health request that asks the agent
+// whether its /storemocks takes a compressed stream. Running out of it is not an
+// error: the mocks then go uncompressed, as to an agent that cannot decompress.
+// It is long because the agent can be a port-forward away over a slow link,
+// where a new connection alone costs several round trips.
+const storeMocksEncodingProbeTimeout = 30 * time.Second
+
+// storeMocksEncoding returns the Content-Encoding to send the mock stream with:
+// zstd when the agent's /health advertises it (Accept-Encoding, RFC 7694), and
+// "" (uncompressed) otherwise, including when the agent cannot be asked. An
+// agent that predates compression has no such header, so it keeps getting the
+// stream it can read.
+func (a *AgentClient) storeMocksEncoding(ctx context.Context) string {
+	ctx, cancel := context.WithTimeout(ctx, storeMocksEncodingProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/health", a.conf.Agent.AgentURI), nil)
+	if err != nil {
+		return ""
+	}
+	res, err := a.client.Do(req)
+	if err != nil {
+		a.logger.Debug("could not ask the agent whether it takes compressed mocks; sending them uncompressed", zap.Error(err))
+		return ""
+	}
+	defer res.Body.Close()
+	_, _ = io.Copy(io.Discard, res.Body)
+	if res.StatusCode == http.StatusOK && acceptsEncoding(res.Header.Values("Accept-Encoding"), models.MockStreamEncodingZstd) {
+		return models.MockStreamEncodingZstd
+	}
+	return ""
+}
+
+// acceptsEncoding reports whether Accept-Encoding header values list coding,
+// ignoring case, spaces and parameters. A coding listed with q=0 is refused
+// (RFC 9110, section 12.5.3).
+func acceptsEncoding(values []string, coding string) bool {
+	for _, v := range values {
+		for _, item := range strings.Split(v, ",") {
+			name, params, _ := strings.Cut(item, ";")
+			if !strings.EqualFold(strings.TrimSpace(name), coding) {
+				continue
+			}
+			for _, p := range strings.Split(params, ";") {
+				k, val, ok := strings.Cut(strings.TrimSpace(p), "=")
+				if ok && strings.EqualFold(k, "q") {
+					if q, err := strconv.ParseFloat(strings.TrimSpace(val), 64); err == nil && q == 0 {
+						return false
+					}
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func encodingName(encoding string) string {
+	if encoding == "" {
+		return "identity"
+	}
+	return encoding
+}
+
+// mockStreamBytes counts a /storemocks stream before compression (raw) and as
+// sent (wire). The encoder goroutine writes them while the caller may read them,
+// hence atomics.
+type mockStreamBytes struct {
+	raw  atomic.Int64
+	wire atomic.Int64
+}
+
+// countingWriter adds what it writes to n.
+type countingWriter struct {
+	w io.Writer
+	n *atomic.Int64
+}
+
+func (c countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n.Add(int64(n))
+	return n, err
 }
 
 // storeMocksStream POSTs the corpus as a gob stream (MockStreamHeader + one
-// frame per mock) and returns the raw response so the caller can decide whether
-// to fall back on a 400.
-func (a *AgentClient) storeMocksStream(ctx context.Context, filtered []*models.Mock, unFiltered []*models.Mock) (*http.Response, error) {
+// frame per mock), zstd-compressed when encoding says so, and returns the raw
+// response so the caller can decide whether to fall back on a 400.
+func (a *AgentClient) storeMocksStream(ctx context.Context, filtered []*models.Mock, unFiltered []*models.Mock, encoding string) (*http.Response, *mockStreamBytes, error) {
 	pr, pw := io.Pipe()
+	sent := &mockStreamBytes{}
 	go func() {
-		enc := gob.NewEncoder(pw)
+		var out io.Writer = countingWriter{w: pw, n: &sent.wire}
+		var zw *zstd.Encoder
+		if encoding == models.MockStreamEncodingZstd {
+			var err error
+			// One encoder goroutine: the link, not the CPU, bounds a remote
+			// upload, and a local one is fast either way.
+			zw, err = zstd.NewWriter(out,
+				zstd.WithEncoderLevel(zstd.SpeedDefault),
+				zstd.WithWindowSize(models.MockStreamZstdWindow),
+				zstd.WithEncoderConcurrency(1))
+			if err != nil {
+				_ = pw.CloseWithError(fmt.Errorf("start the zstd encoder: %w", err))
+				return
+			}
+			out = zw
+		}
+		// The pipe is closed first, so the encoder's Close writes nothing that
+		// could block and only releases its resources.
+		fail := func(err error) {
+			_ = pw.CloseWithError(err)
+			if zw != nil {
+				_ = zw.Close()
+			}
+		}
+		enc := gob.NewEncoder(countingWriter{w: out, n: &sent.raw})
 		if err := enc.Encode(models.MockStreamHeader{
 			FilteredCount:   len(filtered),
 			UnfilteredCount: len(unFiltered),
 		}); err != nil {
-			_ = pw.CloseWithError(err)
+			fail(err)
 			return
 		}
 		i := 0
@@ -879,12 +1116,19 @@ func (a *AgentClient) storeMocksStream(ctx context.Context, filtered []*models.M
 			return nil
 		}
 		if err := encodeAll(filtered); err != nil {
-			_ = pw.CloseWithError(err)
+			fail(err)
 			return
 		}
 		if err := encodeAll(unFiltered); err != nil {
-			_ = pw.CloseWithError(err)
+			fail(err)
 			return
+		}
+		if zw != nil {
+			// Flushes the last block and ends the zstd frame.
+			if err := zw.Close(); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
 		}
 		_ = pw.Close()
 	}()
@@ -899,16 +1143,19 @@ func (a *AgentClient) storeMocksStream(ctx context.Context, filtered []*models.M
 		// reached.)
 		_ = pw.CloseWithError(err)
 		utils.LogError(a.logger, err, "failed to create request for storemocks")
-		return nil, fmt.Errorf("create request for storemocks: %s", err.Error())
+		return nil, nil, fmt.Errorf("create request for storemocks: %s", err.Error())
 	}
 	req.Header.Set("Content-Type", models.StoreMocksStreamContentType)
 	req.Header.Set("Accept", "application/x-gob")
+	if encoding != "" {
+		req.Header.Set("Content-Encoding", encoding)
+	}
 
 	res, err := a.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("send request for storemocks: %s", err.Error())
+		return nil, nil, fmt.Errorf("send request for storemocks: %s", err.Error())
 	}
-	return res, nil
+	return res, sent, nil
 }
 
 // storeMocksLegacy POSTs the corpus in the pre-streaming single-shot framing:
@@ -984,7 +1231,16 @@ func decodeStoreMocksResp(res *http.Response) error {
 	return nil
 }
 
-func (a *AgentClient) UpdateMockParams(ctx context.Context, params models.MockFilterParams) error {
+func (a *AgentClient) UpdateMockParams(ctx context.Context, params models.MockFilterParams) (retErr error) {
+	defer func() {
+		if retErr == nil && a.session().recording() {
+			recorded := copyMockParams(params)
+			a.session().record(stepMockParams, func(c context.Context) error { return a.UpdateMockParams(c, recorded) })
+		}
+	}()
+	// Only a successful answer that says so sets it again below; a call that
+	// fails at any point leaves the client believing nothing.
+	a.consumedPerTest.Store(false)
 	requestBody := models.UpdateMockParamsReq{
 		FilterParams: params,
 	}
@@ -1018,7 +1274,11 @@ func (a *AgentClient) UpdateMockParams(ctx context.Context, params models.MockFi
 		return fmt.Errorf("failed to read response body for updatemockparams: %s", readErr.Error())
 	}
 
-	return agentRespErr("update mock params", res, rawBody)
+	if err := agentRespErr("update mock params", res, rawBody); err != nil {
+		return err
+	}
+	a.consumedPerTest.Store(res.Header.Get(models.ConsumedScopeHeader) == models.ConsumedScopePerTest)
+	return nil
 }
 
 func (a *AgentClient) GetConsumedMocks(ctx context.Context) ([]models.MockState, error) {
@@ -1103,12 +1363,67 @@ func (a *AgentClient) GetServedMocks(ctx context.Context) (map[string]models.Moc
 	return served, nil
 }
 
+// GetMockStats fetches the agent's non-draining mock-session snapshot
+// (GET /mock/stats): the number of mocks stored on this agent process, plus
+// the running consumed/missed totals. The replay setup calls it after the
+// docker-compose bring-up to verify the agent still holds what the session
+// stored before any test fires: a replacement agent (one compose started again
+// in the bring-up retry, had it not been set up again) reports a loaded count
+// of zero.
+func (a *AgentClient) GetMockStats(ctx context.Context) (models.MockStats, error) {
+	url := fmt.Sprintf("%s/mock/stats", a.conf.Agent.AgentURI)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return models.MockStats{}, fmt.Errorf("failed to create request: %s", err.Error())
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := a.client.Do(req)
+	if err != nil {
+		return models.MockStats{}, fmt.Errorf("failed to send request for mock stats: %s", err.Error())
+	}
+
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			utils.LogError(a.logger, err, "failed to close response body for getmockstats")
+		}
+	}()
+
+	// Status before decode, for the same reason as GetServedMocks: a failure
+	// arrives as an error object and decoding it into the struct would report
+	// the decoder's confusion instead of the agent's reason.
+	// An agent that CANNOT answer is not an agent that answered "nothing
+	// stored". 404 is an agent older than this route; 501 is one whose service
+	// does not implement the reader. Both are reported as a distinct, typed
+	// condition so the caller can skip its check instead of concluding the
+	// agent was replaced — otherwise ordinary version skew fails every
+	// docker-compose test set.
+	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusNotImplemented {
+		return models.MockStats{}, fmt.Errorf("%w: agent returned %d", models.ErrMockStatsUnsupported, res.StatusCode)
+	}
+	if res.StatusCode != http.StatusOK {
+		rawBody, _ := readAgentBody(res)
+		return models.MockStats{}, agentRespErr("get mock stats", res, rawBody)
+	}
+
+	var stats models.MockStats
+	if err := json.NewDecoder(res.Body).Decode(&stats); err != nil {
+		return models.MockStats{}, fmt.Errorf("failed to decode response body for getmockstats: %s", err.Error())
+	}
+
+	return stats, nil
+}
+
 func (a *AgentClient) Run(ctx context.Context, _ models.RunOptions) models.AppError {
 	app, err := a.getApp()
 	if err != nil {
 		utils.LogError(a.logger, err, "failed to get app while running")
 		return models.AppError{AppErrorType: models.ErrInternal, Err: err}
 	}
+	// Once this run of the application is over, no stream waits for its
+	// agent to come back, and what was recorded for it is let go.
+	defer a.session().end()
 
 	runAppErrGrp, runAppCtx := errgroup.WithContext(ctx)
 	appErrCh := make(chan models.AppError, 1)
@@ -1152,13 +1467,19 @@ func (a *AgentClient) GetRecentAppLogs(ctx context.Context) string {
 	return app.RecentLogs(ctx)
 }
 
-// startAgent starts the keploy agent process and handles its lifecycle
-func (a *AgentClient) startAgent(ctx context.Context, isDockerCmd bool, opts models.SetupOptions) error {
+// startAgent starts the keploy agent process and handles its lifecycle.
+//
+// The returned channel receives the agent process's exit exactly once — nil
+// for a clean exit — so the readiness wait in Setup can stop the moment the
+// agent is gone instead of polling a dead port for the whole ready budget.
+func (a *AgentClient) startAgent(ctx context.Context, isDockerCmd bool, opts models.SetupOptions) (<-chan error, error) {
 	// Get the errgroup from context
 	grp, ok := ctx.Value(models.ErrGroupKey).(*errgroup.Group)
 	if !ok {
-		return fmt.Errorf("failed to get errorgroup from the context")
+		return nil, fmt.Errorf("failed to get errorgroup from the context")
 	}
+	// Buffered: the exit is reported whether or not anyone is still waiting.
+	exited := make(chan error, 1)
 
 	// Create a context for the agent that can be cancelled independently
 	agentCtx, cancel := context.WithCancel(ctx)
@@ -1168,19 +1489,16 @@ func (a *AgentClient) startAgent(ctx context.Context, isDockerCmd bool, opts mod
 	}
 	opts.ExtraArgs = agent.StartupAgentHook.GetArgs(ctx)
 	if isDockerCmd {
-		// Helper check to ensure the binary running inside docker has the required capabilities
-		if err := utils.CheckRequiredPermissions(); err != nil {
-			a.logger.Error("Failed to start Keploy Agent", zap.Error(err))
-			// Distinct exit code: a caller must be able to tell "Keploy needs
-			// kernel privileges" from "your tests failed", both of which used to
-			// be a bare 1. See utils/exitcodes.go.
-			utils.SetExitCodeOnce(utils.ExitPrivilegeRequired)
-			return err
-		}
+		// This process's own privileges were checked before Setup changed
+		// anything (checkDockerModePrivileges).
 		// Start the agent in Docker container using errgroup
 		grp.Go(func() error {
 			defer cancel() // Cancel agent context when Docker agent stops
-			if err := a.startInDocker(agentCtx, a.logger, opts); err != nil && !errors.Is(agentCtx.Err(), context.Canceled) {
+			err := a.startInDocker(agentCtx, a.logger, opts)
+			// `docker run` exits with the agent's own status, so this carries
+			// the reason an agent that could not start gave for it.
+			exited <- err
+			if err != nil && !errors.Is(agentCtx.Err(), context.Canceled) {
 				a.logger.Error("failed to start Docker agent", zap.Error(err))
 				return err
 			}
@@ -1188,10 +1506,10 @@ func (a *AgentClient) startAgent(ctx context.Context, isDockerCmd bool, opts mod
 		})
 	} else {
 		// Start the agent as a native process
-		err := a.startNativeAgent(agentCtx, opts)
+		err := a.startNativeAgent(agentCtx, opts, exited)
 		if err != nil {
 			cancel()
-			return err
+			return nil, err
 		}
 	}
 
@@ -1201,24 +1519,13 @@ func (a *AgentClient) startAgent(ctx context.Context, isDockerCmd bool, opts mod
 		return nil
 	})
 
-	return nil
+	return exited, nil
 }
 
-// startNativeAgent starts the keploy agent as a native process
-func (a *AgentClient) startNativeAgent(ctx context.Context, opts models.SetupOptions) error {
-
-	// Get the errgroup from context
-	grp, ok := ctx.Value(models.ErrGroupKey).(*errgroup.Group)
-	if !ok {
-		return fmt.Errorf("failed to get errorgroup from the context")
-	}
-
-	keployBin, err := utils.GetCurrentBinaryPath()
-	if err != nil {
-		utils.LogError(a.logger, err, "failed to get current keploy binary path")
-		return err
-	}
-
+// nativeAgentArgs builds the `keploy agent` argv for a natively spawned agent,
+// the control-plane token file included, and records the launch
+// (token.RecordLaunch) so the client holds that agent to the token.
+func (a *AgentClient) nativeAgentArgs(opts models.SetupOptions) []string {
 	// Build args (binary is passed separately to utils)
 	args := []string{
 		"agent",
@@ -1255,6 +1562,9 @@ func (a *AgentClient) startNativeAgent(ctx context.Context, opts models.SetupOpt
 	if opts.GlobalPassthrough {
 		args = append(args, "--global-passthrough")
 	}
+	if opts.DisableHandshakeHold {
+		args = append(args, "--disable-handshake-hold")
+	}
 	if opts.CapturePackets {
 		args = append(args, "--capture-packets")
 	}
@@ -1266,6 +1576,9 @@ func (a *AgentClient) startNativeAgent(ctx context.Context, opts models.SetupOpt
 	}
 	if opts.MockMode {
 		args = append(args, "--mock-mode")
+	}
+	if opts.RecordRequests {
+		args = append(args, "--record-requests")
 	}
 	// Upstream TLS verification. Forwarded UNCONDITIONALLY as =%t, the same
 	// pattern (and for the same reason) as --disable-mapping above: the
@@ -1319,6 +1632,30 @@ func (a *AgentClient) startNativeAgent(ctx context.Context, opts models.SetupOpt
 		args = append(args, "--config-path", opts.ConfigPath)
 	}
 
+	// Recorded apart from the handoff, so an agent that did not get its token
+	// is still one this process launched, and still checked for it.
+	token.RecordLaunch(opts.AgentURI)
+	return appendTokenFileArg(a.logger, args)
+}
+
+// startNativeAgent starts the keploy agent as a native process. The process's
+// exit is sent on exited.
+func (a *AgentClient) startNativeAgent(ctx context.Context, opts models.SetupOptions, exited chan<- error) error {
+
+	// Get the errgroup from context
+	grp, ok := ctx.Value(models.ErrGroupKey).(*errgroup.Group)
+	if !ok {
+		return fmt.Errorf("failed to get errorgroup from the context")
+	}
+
+	keployBin, err := utils.GetCurrentBinaryPath()
+	if err != nil {
+		utils.LogError(a.logger, err, "failed to get current keploy binary path")
+		return err
+	}
+
+	args := a.nativeAgentArgs(opts)
+
 	// The PTY and the cached-credentials probe both exist for one reason: sudo
 	// may prompt for a password. On a platform where the agent is never
 	// elevated (darwin) there is no prompt, and taking the PTY path anyway is
@@ -1335,7 +1672,7 @@ func (a *AgentClient) startNativeAgent(ctx context.Context, opts models.SetupOpt
 	}
 
 	if elevates && agentUtils.NeedsPTY() && !sudoCached {
-		return a.startNativeAgentWithPTY(ctx, keployBin, args, grp)
+		return a.startNativeAgentWithPTY(ctx, keployBin, args, grp, exited)
 	}
 
 	// Create OS-appropriate command (handles sudo/process-group on Unix; plain on Windows)
@@ -1361,6 +1698,10 @@ func (a *AgentClient) startNativeAgent(ctx context.Context, opts models.SetupOpt
 		defer utils.Recover(a.logger)
 
 		err := cmd.Wait()
+		// Reported BEFORE the error is returned below: returning it cancels
+		// the group, and the readiness wait must find the exit already here
+		// when it sees that cancellation.
+		exited <- err
 		// If ctx wasn't cancelled, bubble up unexpected exits
 		if err != nil && ctx.Err() == nil {
 			a.logger.Error("agent process exited with error", zap.Error(err))
@@ -1402,7 +1743,7 @@ func (a *AgentClient) startNativeAgent(ctx context.Context, opts models.SetupOpt
 }
 
 // startNativeAgentWithPTY starts the agent with PTY support for interactive input (e.g., sudo password)
-func (a *AgentClient) startNativeAgentWithPTY(ctx context.Context, keployBin string, args []string, grp *errgroup.Group) error {
+func (a *AgentClient) startNativeAgentWithPTY(ctx context.Context, keployBin string, args []string, grp *errgroup.Group, exited chan<- error) error {
 	// Create command configured for PTY
 	cmd := agentUtils.NewAgentCommandForPTY(keployBin, args)
 
@@ -1427,6 +1768,8 @@ func (a *AgentClient) startNativeAgentWithPTY(ctx context.Context, keployBin str
 		defer utils.Recover(a.logger)
 
 		err := ptyHandle.Wait()
+		// Before the return below, for the reason given in startNativeAgent.
+		exited <- err
 		// If ctx wasn't cancelled, bubble up unexpected exits
 		if err != nil && ctx.Err() == nil {
 			a.logger.Error("agent process exited with error", zap.Error(err))
@@ -1533,8 +1876,9 @@ func (a *AgentClient) logAgentContainerDiagnostics(container string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	logs, _ := exec.CommandContext(ctx, "docker", "logs", "--tail", "200", container).CombinedOutput()
-	state, _ := exec.CommandContext(ctx, "docker", "inspect", "-f",
+	cli := engine.Active().CLI
+	logs, _ := exec.CommandContext(ctx, cli, "logs", "--tail", "200", container).CombinedOutput()
+	state, _ := exec.CommandContext(ctx, cli, "inspect", "-f",
 		"status={{.State.Status}} exitCode={{.State.ExitCode}} oomKilled={{.State.OOMKilled}} error={{.State.Error}}",
 		container).CombinedOutput()
 	a.logger.Warn("keploy-agent did not become ready; captured agent container diagnostics",
@@ -1558,6 +1902,251 @@ func (a *AgentClient) monitorAgent(clientCtx context.Context, agentCtx context.C
 			a.logger.Error("Agent stopped unexpectedly, client operations may be affected", zap.String("next_step", "check agent logs for panic/oom, ensure required capabilities/permissions, or rerun with --debug and verify the agent binary is compatible with the CLI"))
 		}
 	}
+}
+
+// agentStoppedBeforeReady is Setup's error for an agent process that ended
+// before it ever reported ready: nothing will answer, so there is nothing
+// left to wait for.
+//
+// The agent's exit status says why when it knows (cli/agent.go arms it from
+// utils.ExitCodeFor), and it is re-armed here as this process's own code: the
+// agent is a separate process, and its status is the only thing that crosses
+// back. Without that, an agent that could not start for want of privileges
+// and one that could not start for want of tracefs both ended the run with the
+// same bare failure -- and before this wait watched the process at all, with
+// a readiness timeout five and a half minutes later.
+func (a *AgentClient) agentStoppedBeforeReady(exitErr error, isDockerCmd bool) error {
+	var cause error
+	// An *exec.ExitError for an agent keploy started itself, an
+	// *agentContainerExit for one compose started.
+	var ee interface{ ExitCode() int }
+	if errors.As(exitErr, &ee) {
+		switch ee.ExitCode() {
+		case utils.ExitPrivilegeRequired:
+			cause = utils.ErrPrivilegeRequired
+		case utils.ExitEnvironmentUnsupported:
+			cause = utils.ErrEnvironmentUnsupported
+		}
+	}
+	if cause == nil {
+		if exitErr == nil {
+			return errors.New("the keploy agent exited before it became ready")
+		}
+		return fmt.Errorf("the keploy agent exited before it became ready: %w", exitErr)
+	}
+	utils.SetExitCodeOnce(utils.ExitCodeFor(cause))
+	a.logger.Error("the keploy agent could not start", zap.Error(cause), zap.String("next_step", agentStartRemedy(cause, isDockerCmd, runtime.GOOS)))
+	return fmt.Errorf("%w: the keploy agent could not start (%v)", cause, exitErr)
+}
+
+// agentStartRemedy is what the user can do about an agent that could not start
+// for cause, which depends on where it ran.
+//
+// It ran as root either way. Only the Linux agent tags a privilege failure
+// (its eBPF load), and the native one is elevated before it starts (see
+// agentUtils.NewAgentCommand), while the agent container runs as root with the
+// capabilities keploy starts it with. So a privilege the kernel still refused
+// is not one sudo or setcap can give: it is the container's, or the Docker
+// daemon's, to grant -- or, on a machine that is not a container, kernel
+// lockdown or a security policy refused root itself. All this process has is
+// the agent's exit status, which does not say which of those refused it, so
+// the remedy names the candidates rather than picking one.
+//
+// Tracefs is a Linux agent's to need, and all a native one can report
+// missing: it is reached over loopback, so it needs no network, and no remedy
+// may send the user to connect one. No macOS or Windows agent reports anything
+// missing today; the branch for them (goos, the runtime.GOOS it ran on) is
+// there so that one that ever does is not told to mount tracefs, and can only
+// point at its log. The agent container is the one agent that needs a
+// network address, because its hooks send the application's connections to
+// its container's own address: keploy starts it on the network the
+// application's command names, and --network none leaves it none.
+func agentStartRemedy(cause error, isDockerCmd bool, goos string) string {
+	switch {
+	case errors.Is(cause, utils.ErrPrivilegeRequired) && isDockerCmd:
+		return "keploy starts its agent container as root with --cap-add BPF, PERFMON, NET_ADMIN, SYS_RESOURCE and SYS_PTRACE, and the kernel still refused it eBPF. A rootless Docker or Podman cannot grant those capabilities at all; with a rootful daemon, look for what else denies it: an SELinux or AppArmor policy, a Docker whose default seccomp profile predates CAP_BPF, or kernel lockdown. The agent's log above names the operation the kernel refused"
+	case errors.Is(cause, utils.ErrPrivilegeRequired):
+		return "the agent already ran as root and the kernel still refused it eBPF, as it does inside a container that does not grant it: start that container with --privileged, or with --cap-add BPF --cap-add PERFMON --cap-add NET_ADMIN --cap-add SYS_RESOURCE --cap-add SYS_PTRACE, and with tracefs mounted into it (-v /sys/kernel/tracing:/sys/kernel/tracing). A rootless container runtime cannot grant these at all. Outside a container, look for what denies root eBPF: kernel lockdown, or an SELinux or AppArmor policy. The agent's log above names the operation the kernel refused"
+	case isDockerCmd:
+		return "mount debugfs on the machine Docker runs on (mount -t debugfs nodev /sys/kernel/debug): keploy's agent container reaches tracefs through it. Or, if the log says it found no non-loopback IP: keploy starts its agent container on the network the application's command names, and --network none leaves it no address. The agent's log above names which one is missing"
+	case goos != "linux":
+		return "the agent's log above names what is missing"
+	default:
+		return "mount tracefs (mount -t tracefs nodev /sys/kernel/tracing; into a container, -v /sys/kernel/tracing:/sys/kernel/tracing). The agent's log above names what is missing"
+	}
+}
+
+// waitForAgent blocks until the agent started by startAgent answers its health
+// check (nil), its process ends (exited), its ready budget runs out, or ctx is
+// cancelled.
+func (a *AgentClient) waitForAgent(ctx context.Context, exited <-chan error, isDockerCmd bool, opts models.SetupOptions) error {
+	// Wait up to the agent's own healthcheck budget for it to become ready.
+	// Under heavy CI docker-daemon contention the agent container can take
+	// well over a minute just to start (observed: a local-image `docker run`
+	// taking 126s), so a 60s wait gave up prematurely and tore down a
+	// bring-up that would have succeeded. Overridable via KEPLOY_AGENT_READY_TIMEOUT.
+	readyTimeout := pkg.AgentReadyTimeout()
+	if opts.AgentReadyTimeout > 0 {
+		readyTimeout = opts.AgentReadyTimeout
+	}
+	agentCtx, cancel := context.WithTimeout(ctx, readyTimeout)
+	defer cancel()
+
+	agentReadyCh := make(chan bool, 1)
+	go pkg.AgentHealthTicker(agentCtx, a.logger, a.conf.Agent.AgentURI, agentReadyCh, 1*time.Second)
+
+	// agentCtx is ctx's child, so its Done covers the caller's cancellation
+	// as well as the budget running out, and the ticker closes agentReadyCh
+	// (ready == false) on either. Which of those it was is decided below, in
+	// order, rather than by whichever case the select happens to pick when
+	// several are ready at once.
+	var ready bool
+	select {
+	case exitErr := <-exited:
+		return a.agentStoppedBeforeReady(exitErr, isDockerCmd)
+	case <-agentCtx.Done():
+	case ready = <-agentReadyCh:
+	}
+	if ready {
+		return nil
+	}
+	if ctx.Err() != nil {
+		// The caller's Ctrl+C -- or a goroutine in the caller's errgroup
+		// failing, which cancels ctx too. The one waiting on the agent
+		// process is such a goroutine, and it reports the exit before it
+		// fails the group, so when that is what happened the exit is already
+		// here. Otherwise the cause says which it was: ctx.Err() is "context
+		// canceled" for both, and a caller could not tell keploy failing
+		// from the user stopping it.
+		select {
+		case exitErr := <-exited:
+			return a.agentStoppedBeforeReady(exitErr, isDockerCmd)
+		default:
+		}
+		return context.Cause(ctx)
+	}
+	// The agent never reported healthy. Setup's cleanup defer is not in
+	// scope yet, so without this the wedged agent container and its
+	// goroutine leak — and any retry inherits the mess. Dump the container's
+	// own logs first: the CLI otherwise shows the full readiness window of
+	// silence followed by a bare error, with nothing to root-cause from.
+	if isDockerCmd {
+		a.logAgentContainerDiagnostics(opts.KeployContainer)
+	}
+	a.stopAgent()
+	// Sentinel so the caller can retry a fresh bring-up on this specific,
+	// nondeterministic stall without retrying deterministic failures.
+	return fmt.Errorf("%w", pkg.ErrAgentNotReady)
+}
+
+// perfEventParanoidPath is the kernel knob docker mode relaxes for its agent's
+// tracepoints. It is not namespaced: read or written from inside a container,
+// it is the host's.
+//
+// A variable so a test can point it at a file of its own.
+var perfEventParanoidPath = "/proc/sys/kernel/perf_event_paranoid"
+
+// The remedies checkDockerModePrivileges logs, one for each thing it can be
+// refused. Both are for a process that may already be root: a CI job
+// container runs keploy as root, and /proc/sys is read-only to root in any
+// container that is not --privileged, whatever capabilities it was given.
+const (
+	dockerModeCapabilitiesRemedy = "keploy's docker mode needs the capabilities named above in the process that runs it. Run keploy as root on the machine Docker runs on, or, inside a container, start that container with --privileged. --cap-add for each of them works too, but leaves /proc/sys read-only, so then set kernel.perf_event_paranoid to 2 or lower on the host first (sysctl -w kernel.perf_event_paranoid=2), which keploy would otherwise do itself"
+	perfEventParanoidRemedy      = "keploy's docker mode lowers kernel.perf_event_paranoid to 2 so its agent can attach to syscall tracepoints, and this process may not write it. Set it on the host first (sysctl -w kernel.perf_event_paranoid=2) and keploy leaves it as it is; or run keploy as root on the host, or inside a container started with --privileged"
+)
+
+// checkDockerModePrivileges fails, with ErrPrivilegeRequired and the privilege
+// exit code armed, when this process cannot run keploy's docker mode: it lacks
+// the capabilities the check below asks for, or it may not relax
+// perf_event_paranoid for the agent's tracepoints. That relaxing is the one
+// change it makes, and the first one docker mode makes.
+func (a *AgentClient) checkDockerModePrivileges(opts models.SetupOptions) error {
+	// docker run, docker start and --from-container start the agent container
+	// from this process, and have always been held to the capability check;
+	// docker compose starts it as a service of the user's own project, and
+	// never was.
+	if utils.CmdType(opts.CommandType) != utils.DockerCompose {
+		if err := utils.CheckRequiredPermissions(); err != nil {
+			return a.dockerModeRefused(fmt.Errorf("%w: %w", utils.ErrPrivilegeRequired, err), dockerModeCapabilitiesRemedy)
+		}
+	}
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	err := relaxPerfEventParanoid()
+	if errors.Is(err, utils.ErrPrivilegeRequired) {
+		return a.dockerModeRefused(err, perfEventParanoidRemedy)
+	}
+	if err != nil {
+		a.logger.Error("Failed to relax host perf_event_paranoid. Tracepoints may fail.", zap.Error(err))
+	}
+	return err
+}
+
+// dockerModeRefused arms the privilege exit code for err and logs it with the
+// remedy. Distinct exit code: a caller must be able to tell "Keploy needs
+// kernel privileges" from "your tests failed", both of which used to be a bare
+// 1. See utils/exitcodes.go.
+func (a *AgentClient) dockerModeRefused(err error, remedy string) error {
+	utils.SetExitCodeOnce(utils.ExitPrivilegeRequired)
+	a.logger.Error("keploy cannot run in docker mode here", zap.Error(err), zap.String("next_step", remedy))
+	return err
+}
+
+// relaxPerfEventParanoid makes sure perf_event_paranoid is at most 2, which
+// lets the agent's eBPF programs attach to syscall tracepoints like sys_socket
+// via perf_event_open: the Debian and Ubuntu defaults (3 and 4) block this for
+// unprivileged users. The value is written straight to the procfs knob instead
+// of shelling out to the `sysctl` binary, which isn't guaranteed to be present
+// in minimal images.
+//
+// A value that already allows it is left as it is. Writing 2 over it would
+// tighten a host set lower, and the write needs what a container that is not
+// --privileged never has, a writable /proc/sys, so a host set up in advance
+// is how such a container gets to run keploy's docker mode at all. A write
+// this process is not allowed to make is tagged ErrPrivilegeRequired.
+func relaxPerfEventParanoid() error {
+	if current, err := os.ReadFile(perfEventParanoidPath); err == nil {
+		if level, err := strconv.Atoi(strings.TrimSpace(string(current))); err == nil && level <= 2 {
+			return nil
+		}
+	}
+	err := os.WriteFile(perfEventParanoidPath, []byte("2\n"), 0644)
+	if errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS) {
+		return fmt.Errorf("%w: %w", utils.ErrPrivilegeRequired, err)
+	}
+	return err
+}
+
+// fetchAgentCA retrieves the running agent's MITM CA public certificate over the
+// token-authenticated control-plane API. a.client already carries the bearer
+// token, so this inherits the same guard as every other control-plane call. The
+// returned bytes are a PEM certificate — public material, never the private key.
+func (a *AgentClient) fetchAgentCA(ctx context.Context) ([]byte, error) {
+	url := fmt.Sprintf("%s/ca", a.conf.Agent.AgentURI)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build CA request: %w", err)
+	}
+	res, err := a.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to request the agent CA: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
+		return nil, fmt.Errorf("agent returned %d fetching the CA: %s", res.StatusCode, strings.TrimSpace(string(body)))
+	}
+	// Cap the read: a CA PEM is a few KB; a megabyte ceiling is generous and
+	// bounds a misbehaving endpoint.
+	certPEM, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the agent CA: %w", err)
+	}
+	if len(certPEM) == 0 {
+		return nil, fmt.Errorf("agent returned an empty CA certificate")
+	}
+	return certPEM, nil
 }
 
 func (a *AgentClient) Setup(ctx context.Context, cmd string, opts models.SetupOptions) error {
@@ -1604,6 +2193,16 @@ func (a *AgentClient) Setup(ctx context.Context, cmd string, opts models.SetupOp
 		zap.Uint32("dns-port", dnsPort))
 
 	if isDockerCmd {
+		// Whether docker mode can run here at all is settled before anything
+		// is changed for it: the user's --from-container container stopped,
+		// the host's perf_event_paranoid written. Both used to come first, so
+		// keploy run as root in an unprivileged container -- a CI job's, with
+		// the host's Docker socket -- stopped the user's container and then
+		// failed with a bare 1 on the read-only /proc/sys, never reaching the
+		// capability check that says why.
+		if err := a.checkDockerModePrivileges(opts); err != nil {
+			return err
+		}
 
 		var origCmd = cmd
 		a.logger.Debug("Application command provided :", zap.String("cmd", cmd))
@@ -1670,68 +2269,29 @@ func (a *AgentClient) Setup(ctx context.Context, cmd string, opts models.SetupOp
 				zap.String("cmd", cmd),
 			)
 		}
-
-		// Lower perf_event_paranoid to allow eBPF programs to attach to syscall tracepoints
-		// like sys_socket via perf_event_open. Ubuntu/Debian default (4) blocks this for
-		// unprivileged users, so setting 2 relaxes the restriction and enables tracing.
-		// Write the value straight to the procfs knob instead of shelling out to the
-		// `sysctl` binary, which isn't guaranteed to be present in minimal images.
-		if runtime.GOOS == "linux" {
-			const perfEventParanoidPath = "/proc/sys/kernel/perf_event_paranoid"
-			if err := os.WriteFile(perfEventParanoidPath, []byte("2\n"), 0644); err != nil {
-				a.logger.Error("Failed to relax host perf_event_paranoid. Tracepoints may fail.", zap.Error(err))
-				return err
-			}
-		}
 	}
 
 	if opts.CommandType != string(utils.DockerCompose) { // in case of docker compose, we will run the application command (our agent will run along with it)
 		opts.ClientNSPID = uint32(os.Getpid())
-		err = a.startAgent(ctx, isDockerCmd, opts)
+		var agentExited <-chan error
+		agentExited, err = a.startAgent(ctx, isDockerCmd, opts)
 		if err != nil {
 			return fmt.Errorf("failed to start agent: %w", err)
 		}
 		a.logger.Debug("Agent is now running, proceeding with setup")
 
-		// Wait up to the agent's own healthcheck budget for it to become ready.
-		// Under heavy CI docker-daemon contention the agent container can take
-		// well over a minute just to start (observed: a local-image `docker run`
-		// taking 126s), so a 60s wait gave up prematurely and tore down a
-		// bring-up that would have succeeded. Overridable via KEPLOY_AGENT_READY_TIMEOUT.
-		readyTimeout := pkg.AgentReadyTimeout()
-		if opts.AgentReadyTimeout > 0 {
-			readyTimeout = opts.AgentReadyTimeout
-		}
-		agentCtx, cancel := context.WithTimeout(ctx, readyTimeout)
-		defer cancel()
-
-		agentReadyCh := make(chan bool, 1)
-		go pkg.AgentHealthTicker(agentCtx, a.logger, a.conf.Agent.AgentURI, agentReadyCh, 1*time.Second)
-
-		select {
-		case <-ctx.Done():
-			// Parent context cancelled (user pressed Ctrl+C)
-			return ctx.Err()
-		case <-agentCtx.Done():
-			// The agent never reported healthy. The cleanup defer below is not in
-			// scope yet, so without this the wedged agent container and its
-			// goroutine leak — and any retry inherits the mess. Dump the container's
-			// own logs first: the CLI otherwise shows the full readiness window of
-			// silence followed by a bare error, with nothing to root-cause from.
-			if isDockerCmd {
-				a.logAgentContainerDiagnostics(opts.KeployContainer)
-			}
-			a.stopAgent()
-			// Sentinel so the caller can retry a fresh bring-up on this specific,
-			// nondeterministic stall without retrying deterministic failures.
-			return fmt.Errorf("%w", pkg.ErrAgentNotReady)
-		case <-agentReadyCh:
+		if err = a.waitForAgent(ctx, agentExited, isDockerCmd, opts); err != nil {
+			return err
 		}
 	}
 
 	// Continue with app setup and registration as per normal flow
 	usrApp := app.NewApp(a.logger, cmd, a.dockerClient, opts)
 	a.apps.Store(uint64(0), usrApp) // key = 0, since there's only one client per agent
+	// Under compose the agent is the user's project's to start again: the
+	// session puts back what the run set up on it (see agentSession).
+	a.session().configure(utils.CmdType(opts.CommandType) == utils.DockerCompose)
+	usrApp.SetOnAgentRestart(a.setUpRestartedAgent)
 
 	// Set up cleanup on failure
 	defer func() {
@@ -1741,32 +2301,30 @@ func (a *AgentClient) Setup(ctx context.Context, cmd string, opts models.SetupOp
 		}
 	}()
 
-	// TODO : Proxy or TLS should not be importes in the agent
-	// This is done because to set env variable for TLS
-	err = ptls.SetupCaCertEnv(a.logger)
-	if err != nil {
-		utils.LogError(a.logger, err, "failed to set TLS environment")
-		return err
+	// Native mode only: the application runs as a child of this client and
+	// inherits its environment, so the client points the language-runtime trust
+	// env vars at the agent's CA. The CA is generated per run and lives in the
+	// agent process, so the client fetches its PUBLIC certificate over the
+	// token-authenticated control-plane API rather than carrying an embedded copy
+	// of a shared CA. In docker-run, compose and k8s the shared /tmp/keploy-tls
+	// volume delivers trust to the app container instead, and this call would only
+	// leak an unused host temp file — so it is skipped there.
+	if !isDockerCmd && opts.CommandType != string(utils.DockerCompose) {
+		certPEM, caErr := a.fetchAgentCA(ctx)
+		if caErr != nil {
+			utils.LogError(a.logger, caErr, "failed to fetch the agent's CA certificate; the app would not trust keploy's MITM leaves",
+				zap.String("next_step", "ensure the agent started cleanly (check the agent log for a SetupCA error) and retry"))
+			return caErr
+		}
+		// TODO : Proxy or TLS should not be imported in the agent
+		// This is done because to set env variable for TLS
+		if err = ptls.SetupCaCertEnv(a.logger, certPEM); err != nil {
+			utils.LogError(a.logger, err, "failed to set TLS environment")
+			return err
+		}
 	}
 
-	// Mock mode: export the agent's scope-API address into the wrapped
-	// command's environment so a test-runner plugin / glue-code can mark
-	// per-test boundaries (POST {KEPLOY_MOCK_AGENT}/agent/scope/begin|end).
-	// The child inherits this process's environment. Native + docker-run put
-	// the child in the agent's netns, so localhost:<agentPort> reaches it;
-	// docker-compose shares the host loopback. Harmless when unused.
-	if opts.MockMode {
-		if err := os.Setenv("KEPLOY_MOCK_AGENT", fmt.Sprintf("http://localhost:%d", agentPort)); err != nil {
-			a.logger.Debug("failed to export KEPLOY_MOCK_AGENT", zap.Error(err))
-		}
-		session := "record"
-		if opts.Mode == models.MODE_TEST {
-			session = "replay"
-		}
-		if err := os.Setenv("KEPLOY_MOCK_SESSION", session); err != nil {
-			a.logger.Debug("failed to export KEPLOY_MOCK_SESSION", zap.Error(err))
-		}
-	}
+	exportMockScopeEnv(a.logger, opts, agentPort)
 
 	err = usrApp.Setup(ctx)
 	if err != nil {
@@ -1776,6 +2334,51 @@ func (a *AgentClient) Setup(ctx context.Context, cmd string, opts models.SetupOp
 
 	a.logger.Debug("Keploy client setup completed successfully")
 	return nil
+}
+
+// exportMockScopeEnv exports the agent's scope-API address, and the token it
+// needs, into the wrapped command's environment in mock mode, so a test-runner
+// plugin / glue-code can mark per-test boundaries
+// (POST {KEPLOY_MOCK_AGENT}/agent/scope/begin|end). The child inherits this
+// process's environment. Native + docker-run put the child in the agent's
+// netns, so localhost:<agentPort> reaches it; docker-compose shares the host
+// loopback. Harmless when unused.
+//
+// Nothing at all outside mock mode: there the wrapped command is the
+// application under test, and it is handed nothing.
+func exportMockScopeEnv(logger *zap.Logger, opts models.SetupOptions, agentPort uint32) {
+	if !opts.MockMode {
+		return
+	}
+	if err := os.Setenv("KEPLOY_MOCK_AGENT", fmt.Sprintf("http://localhost:%d", agentPort)); err != nil {
+		logger.Debug("failed to export KEPLOY_MOCK_AGENT", zap.Error(err))
+	}
+	// The scope API is guarded like every other control-plane route, and
+	// this caller is not keploy — it is the user's test runner. Without a
+	// credential the advertised integration would simply 401.
+	//
+	// os.Setenv is process-wide, so strictly every child started after
+	// this inherits it, not only the wrapped runner. That is the same
+	// trust domain: in mock mode the wrapped process is the intended API
+	// client, and the incidental children are keploy's own docker and
+	// shell teardown commands. What matters is the guard above: only in
+	// mock mode, so the application under test in a record or test run is
+	// still handed nothing.
+	//
+	// A separate variable from token.Env, so a process that inherits it
+	// presents the token rather than adopting it as one to enforce.
+	if tok := token.Session(); tok != "" {
+		if err := os.Setenv(token.MockAgentTokenEnv, tok); err != nil {
+			logger.Debug("failed to export "+token.MockAgentTokenEnv, zap.Error(err))
+		}
+	}
+	session := "record"
+	if opts.Mode == models.MODE_TEST {
+		session = "replay"
+	}
+	if err := os.Setenv("KEPLOY_MOCK_SESSION", session); err != nil {
+		logger.Debug("failed to export KEPLOY_MOCK_SESSION", zap.Error(err))
+	}
 }
 
 func (a *AgentClient) getApp() (*app.App, error) {
@@ -1791,6 +2394,83 @@ func (a *AgentClient) getApp() (*app.App, error) {
 	}
 
 	return h, nil
+}
+
+// ComposeAgentOutcome is what the keploy-agent compose service served and
+// missed in a mock replay, as it wrote it on being stopped.
+//
+// Under docker compose it is the only way to learn either: compose stops the
+// agent service the moment the app exits, so the agent is gone before
+// GetConsumedMocks or GetMockErrors could reach it. The App reads the account
+// out of the stopped container before keploy's teardown removes it.
+func (a *AgentClient) ComposeAgentOutcome() (models.MockOutcome, error) {
+	ap, err := a.getApp()
+	if err != nil {
+		return models.MockOutcome{}, err
+	}
+	stopped, ok := ap.StoppedAgent()
+	if !ok {
+		return models.MockOutcome{}, errors.New("keploy did not read the keploy-agent container before it was removed")
+	}
+	return stopped.MockOutcome()
+}
+
+// agentContainerExit is a keploy-agent container that stopped, as docker
+// reports it. Its ExitCode is the agent's own status: the agent is the
+// container's process.
+type agentContainerExit struct {
+	container string
+	code      int
+	oomKilled bool
+}
+
+func (e *agentContainerExit) Error() string {
+	msg := fmt.Sprintf("the keploy-agent container %s exited with code %d", e.container, e.code)
+	if e.oomKilled {
+		msg += ", killed for running out of memory"
+	}
+	return msg
+}
+
+func (e *agentContainerExit) ExitCode() int { return e.code }
+
+// ComposeAgentFailure is the keploy-agent compose service stopping while the
+// app still needed it, as keploy's own failure -- and nil when it did not,
+// which is every run in which compose stopped the agent after the app exited.
+//
+// Under compose the agent is a service in the project, and when it stops
+// first, compose aborts the project over it: the exit that reaches keploy is
+// compose reporting the dependency it lost, or the test command's code after
+// compose stopped it, and neither is the test command's verdict. The agent's
+// container, read before keploy's teardown removes it, says which it was.
+//
+// An agent that stopped before the app ever started could not start at all,
+// and its exit status says why, exactly as a native agent's does
+// (agentStoppedBeforeReady): the specific code is armed, and the remedy
+// logged.
+func (a *AgentClient) ComposeAgentFailure() error {
+	ap, err := a.getApp()
+	if err != nil {
+		return nil
+	}
+	stopped, ok := ap.StoppedAgent()
+	if !ok {
+		return nil
+	}
+	return a.composeAgentFailure(stopped)
+}
+
+// composeAgentFailure is ComposeAgentFailure for what keploy read from the
+// stopped agent's container.
+func (a *AgentClient) composeAgentFailure(stopped app.StoppedAgent) error {
+	if !stopped.AgentFailed() {
+		return nil
+	}
+	exit := &agentContainerExit{container: stopped.Container, code: stopped.Agent.ExitCode, oomKilled: stopped.Agent.OOMKilled}
+	if !stopped.AppStarted() {
+		return a.agentStoppedBeforeReady(exit, true)
+	}
+	return fmt.Errorf("the keploy agent stopped while the test command was running: %w", exit)
 }
 
 // ComposeDownOnSetupFailure tears down the managed docker-compose stack so a
@@ -1829,12 +2509,13 @@ func (a *AgentClient) startInDocker(ctx context.Context, logger *zap.Logger, opt
 		containerName := opts.KeployContainer
 
 		// Try stopping the container without sudo first (works if user is in docker group)
-		stopCmd := exec.Command("docker", "stop", containerName)
+		cli := engine.Active().CLI
+		stopCmd := exec.Command(cli, "stop", containerName)
 		if output, err := stopCmd.CombinedOutput(); err != nil {
 			// If that fails on Linux, try with sudo -n (non-interactive, won't prompt for password)
 			if runtime.GOOS == "linux" {
 				logger.Debug("docker stop without sudo failed, trying with sudo -n", zap.Error(err))
-				stopCmd = exec.Command("sudo", "-n", "docker", "stop", containerName)
+				stopCmd = exec.Command("sudo", "-n", cli, "stop", containerName)
 				if output, err := stopCmd.CombinedOutput(); err != nil {
 					logger.Debug("Could not stop the docker container. It may have already stopped.",
 						zap.String("container", containerName),
@@ -1859,7 +2540,7 @@ func (a *AgentClient) startInDocker(ctx context.Context, logger *zap.Logger, opt
 		return nil
 	}
 
-	logger.Debug("running the following command to start agent in docker", zap.String("command", cmd.String()))
+	logger.Debug("running the following command to start agent in docker", zap.String("command", redactToken(cmd.String())))
 
 	// Check if we need PTY for interactive input (e.g., sudo password on Linux)
 	if agentUtils.NeedsPTY() {
@@ -1965,7 +2646,22 @@ func (a *AgentClient) GetMockErrors(ctx context.Context) ([]models.UnmatchedCall
 // endpoint (older agent) returns 404 and is treated as a no-op, preserving the
 // legacy global-queue behaviour.
 func (a *AgentClient) BeginTestErrorCapture(ctx context.Context) error {
+	return a.openTestErrorCapture(ctx, false)
+}
+
+// ContinueTestErrorCapture is BeginTestErrorCapture for a test after its set's
+// first: the window carries in the misses made since the previous test's
+// window closed. An agent that predates it ignores ?carry and opens the window
+// as Begin does.
+func (a *AgentClient) ContinueTestErrorCapture(ctx context.Context) error {
+	return a.openTestErrorCapture(ctx, true)
+}
+
+func (a *AgentClient) openTestErrorCapture(ctx context.Context, carry bool) error {
 	url := fmt.Sprintf("%s/test-capture/begin", a.conf.Agent.AgentURI)
+	if carry {
+		url += "?carry=1"
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %s", err.Error())
@@ -1989,6 +2685,42 @@ func (a *AgentClient) BeginTestErrorCapture(ctx context.Context) error {
 		return fmt.Errorf("begin test error capture returned status %d: %s", res.StatusCode, string(body))
 	}
 	return nil
+}
+
+// PendingBefore asks the agent whether it may still hand over a test case or a
+// mock captured before `before` (GET /agent/record/pending). known is false when
+// it cannot tell: an agent that predates the route, or a capture without a
+// watermark (proxy mode). A recording's stop then goes by its streams' quiet
+// alone.
+func (a *AgentClient) PendingBefore(ctx context.Context, before time.Time) (pending, known bool, err error) {
+	if a.conf.Agent.AgentURI == "" {
+		return false, false, nil
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	url := fmt.Sprintf("%s/record/pending?before=%d", a.conf.Agent.AgentURI, before.UnixNano())
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, false, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return false, false, err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return false, false, nil // 404 (older agent), 501 (cannot tell)
+	}
+	var out struct {
+		Pending bool `json:"pending"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, false, err
+	}
+	return out.Pending, true, nil
 }
 
 // NotifyGracefulShutdown sends a request to the agent to set the graceful shutdown flag.
@@ -2038,7 +2770,12 @@ func (a *AgentClient) NotifyGracefulShutdown(ctx context.Context) error {
 	return nil
 }
 
-func (a *AgentClient) MakeAgentReadyForDockerCompose(ctx context.Context) error {
+func (a *AgentClient) MakeAgentReadyForDockerCompose(ctx context.Context) (retErr error) {
+	defer func() {
+		if retErr == nil {
+			a.session().record(stepAgentReady, func(c context.Context) error { return a.MakeAgentReadyForDockerCompose(c) })
+		}
+	}()
 	// Aligned with the agent's own healthcheck budget; see pkg.AgentReadyTimeout.
 	ctx, cancel := context.WithTimeout(ctx, pkg.AgentReadyTimeout())
 	defer cancel()
@@ -2098,10 +2835,10 @@ func (a *AgentClient) StreamPcapArtifacts(ctx context.Context, destDir string) e
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		return a.streamPcapArtifact(gctx, "/pcap/traffic", filepath.Join(destDir, "traffic.pcap"), 0o644)
+		return a.streamPcapArtifact(gctx, "/pcap/traffic", filepath.Join(destDir, "traffic.pcap"), 0o644, false)
 	})
 	g.Go(func() error {
-		return a.streamPcapArtifact(gctx, "/pcap/keylog", filepath.Join(destDir, "sslkeys.log"), 0o644)
+		return a.streamPcapArtifact(gctx, "/pcap/keylog", filepath.Join(destDir, "sslkeys.log"), 0o644, true)
 	})
 	return g.Wait()
 }
@@ -2112,19 +2849,58 @@ func (a *AgentClient) StreamPcapArtifacts(ctx context.Context, destDir string) e
 // stays a no-op for non-capture sessions. Other non-200s surface as
 // errors. Context cancellation returns nil so callers don't see
 // spurious errors at recording stop.
-func (a *AgentClient) streamPcapArtifact(ctx context.Context, urlPath, dstFile string, mode os.FileMode) error {
+func (a *AgentClient) streamPcapArtifact(ctx context.Context, urlPath, dstFile string, mode os.FileMode, appendable bool) error {
 	url := fmt.Sprintf("%s%s", a.conf.Agent.AgentURI, urlPath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("build pcap stream request: %w", err)
 	}
-	resp, err := a.client.Do(req)
+	// Registered before it connects; it outlives a restarted agent (see
+	// agentSession), going on in a file of its own (a capture), or in the
+	// same file (appendable, as the key log is).
+	stream := a.session().openStream()
+	defer stream.close()
+	conn := stream.connect(ctx)
+	resp, err := a.client.Do(req.WithContext(conn.ctx))
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
 		}
 		return fmt.Errorf("dial %s: %w", url, err)
 	}
+	resp.Body = conn.body(resp.Body)
+	for n := 1; ; n++ {
+		path, flags := dstFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC
+		if n > 1 && appendable {
+			flags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+		} else if n > 1 {
+			ext := filepath.Ext(dstFile)
+			path = fmt.Sprintf("%s.%d%s", strings.TrimSuffix(dstFile, ext), n, ext)
+		}
+		copyErr, err := a.copyPcapStream(resp, url, path, flags, mode)
+		if errors.Is(err, errNoPcapStream) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var ok bool
+		if resp, ok = a.resumeStream(ctx, stream, "pcap stream "+urlPath, http.MethodGet, urlPath, nil); !ok {
+			if copyErr != nil && !errors.Is(copyErr, context.Canceled) {
+				return copyErr
+			}
+			return nil
+		}
+	}
+}
+
+// errNoPcapStream is an agent with no pcap stream to serve: capture is off.
+var errNoPcapStream = errors.New("the agent serves no pcap stream")
+
+// copyPcapStream writes one pcap stream response to path. It returns how the
+// copy ended, and an error when there was nothing to copy into a file
+// (errNoPcapStream when capture is off).
+func (a *AgentClient) copyPcapStream(resp *http.Response, url, path string, flags int, mode os.FileMode) (copyErr, err error) {
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil && !errors.Is(cerr, context.Canceled) {
 			a.logger.Debug("failed to close pcap stream body", zap.String("url", url), zap.Error(cerr))
@@ -2135,37 +2911,34 @@ func (a *AgentClient) streamPcapArtifact(ctx context.Context, urlPath, dstFile s
 	case http.StatusNotFound, http.StatusServiceUnavailable:
 		a.logger.Debug("agent reports no pcap stream available; capture likely off",
 			zap.String("url", url))
-		return nil
+		return nil, errNoPcapStream
 	case http.StatusOK:
 		// fall through to the long copy below
 	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("stream %s: status %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("stream %s: status %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	out, err := os.OpenFile(dstFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	out, err := os.OpenFile(path, flags, mode)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", dstFile, err)
+		return nil, fmt.Errorf("create %s: %w", path, err)
 	}
 	defer func() {
 		if cerr := out.Close(); cerr != nil {
 			a.logger.Warn("failed to close pcap dst file",
-				zap.String("path", dstFile), zap.Error(cerr))
+				zap.String("path", path), zap.Error(cerr))
 		}
 	}()
 
 	a.logger.Debug("pcap stream connected",
-		zap.String("url", url), zap.String("path", dstFile))
+		zap.String("url", url), zap.String("path", path))
 	written, copyErr := io.Copy(out, resp.Body)
 	a.logger.Debug("pcap stream ended",
 		zap.String("url", url),
-		zap.String("path", dstFile),
+		zap.String("path", path),
 		zap.Int64("bytes", written),
 		zap.Error(copyErr))
-	if copyErr != nil && !errors.Is(copyErr, context.Canceled) {
-		return copyErr
-	}
-	return nil
+	return copyErr, nil
 }
 
 // GetScopeWindows fetches the per-test scope windows the wrapped runner reported
@@ -2200,10 +2973,41 @@ func (a *AgentClient) GetScopeWindows(ctx context.Context) ([]models.ScopeWindow
 	return windows, nil
 }
 
+func (a *AgentClient) PushSetTable(ctx context.Context, root string, sets map[string]models.SetTable) error {
+	body, err := json.Marshal(models.ScopeTableReq{Root: root, Sets: sets})
+	if err != nil {
+		return fmt.Errorf("failed to marshal the app start table: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/scope/table", a.conf.Agent.AgentURI), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to push the app start table: %w", err)
+	}
+	defer func() {
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}()
+	if res.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("app start table returned status %d: %s", res.StatusCode, string(b))
+	}
+	return nil
+}
+
 // PushScopeTable hands the agent the replay-time per-test name→mock-names table
 // (from mappings.yaml) so the runner's /agent/scope/begin calls can restrict the
 // served pool per test. A missing endpoint (older agent) is a no-op.
-func (a *AgentClient) PushScopeTable(ctx context.Context, table map[string][]string) error {
+func (a *AgentClient) PushScopeTable(ctx context.Context, table map[string][]string) (retErr error) {
+	defer func() {
+		if retErr == nil && a.session().recording() {
+			recorded := maps.Clone(table)
+			a.session().record(stepScopeTable, func(c context.Context) error { return a.PushScopeTable(c, recorded) })
+		}
+	}()
 	url := fmt.Sprintf("%s/scope/table", a.conf.Agent.AgentURI)
 	body, err := json.Marshal(models.ScopeTableReq{Mappings: table})
 	if err != nil {
@@ -2228,6 +3032,44 @@ func (a *AgentClient) PushScopeTable(ctx context.Context, table map[string][]str
 	if res.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(res.Body)
 		return fmt.Errorf("scope table returned status %d: %s", res.StatusCode, string(b))
+	}
+	return nil
+}
+
+// PushScopeGate tells the agent which tests should run this replay; run == nil
+// lets every test run. The gate is made again on a restarted agent, like the
+// scope table. An agent that cannot gate (older: 404; or 501) returns
+// models.ErrScopeGateUnsupported.
+func (a *AgentClient) PushScopeGate(ctx context.Context, run []string, reason string) (retErr error) {
+	defer func() {
+		if retErr == nil && a.session().recording() {
+			recorded := slices.Clone(run)
+			a.session().record(stepScopeGate, func(c context.Context) error { return a.PushScopeGate(c, recorded, reason) })
+		}
+	}()
+	body, err := json.Marshal(models.ScopeGateReq{Run: run, Reason: reason})
+	if err != nil {
+		return fmt.Errorf("failed to marshal the scope gate: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/replay/gate", a.conf.Agent.AgentURI), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create the scope-gate request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to push the scope gate: %w", err)
+	}
+	defer func() {
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}()
+	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusNotImplemented {
+		return models.ErrScopeGateUnsupported
+	}
+	if res.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("scope gate returned status %d: %s", res.StatusCode, string(b))
 	}
 	return nil
 }
@@ -2942,4 +3784,25 @@ func (a *AgentClient) restoreShortfall(ctx context.Context, name string) (proble
 	}
 
 	return problems, true, nil
+}
+
+func (a *AgentClient) GetIDPairs(ctx context.Context) (map[string]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.conf.Agent.AgentURI+"/ids", nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		rawBody, _ := readAgentBody(res)
+		return nil, agentRespErr("get id pairs", res, rawBody)
+	}
+	var pairs map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&pairs); err != nil {
+		return nil, err
+	}
+	return pairs, nil
 }

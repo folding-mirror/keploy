@@ -38,6 +38,7 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"go.keploy.io/server/v3/pkg/models"
+	keployLog "go.keploy.io/server/v3/utils/log"
 	"go.uber.org/zap"
 	"helm.sh/helm/v3/pkg/strvals"
 )
@@ -352,8 +353,16 @@ func DeleteFileIfExists(logger *zap.Logger, name string) (err error) {
 }
 
 type GitHubRelease struct {
-	TagName string `json:"tag_name"`
-	Body    string `json:"body"`
+	TagName string               `json:"tag_name"`
+	Body    string               `json:"body"`
+	Assets  []GitHubReleaseAsset `json:"assets"`
+}
+
+// GitHubReleaseAsset is one file of a release. Digest is GitHub's own
+// "sha256:<hex>" of it, which `keploy update` checks the download against.
+type GitHubReleaseAsset struct {
+	Name   string `json:"name"`
+	Digest string `json:"digest"`
 }
 
 var ErrGitHubAPIUnresponsive = errors.New("GitHub API is unresponsive")
@@ -457,18 +466,12 @@ func ConfigHeader() string {
 		"#   keploy config defaults -o FILE    # save them\n"
 }
 
-func attachLogFileToSentry(logger *zap.Logger, logFilePath string) error {
-	file, err := os.Open(logFilePath)
-	if err != nil {
-		return fmt.Errorf("error opening log file: %s", err.Error())
-	}
-	defer func() {
-		if err := file.Close(); err != nil {
-			LogError(logger, err, "Error closing log file")
-		}
-	}()
-
-	content, err := io.ReadAll(file)
+// attachLogFileToSentry attaches logFile, this run's log, to the crash report:
+// read through its name only while that is still this run's log, never
+// whatever a symlink there points at (a root run's crash would otherwise send
+// the link's target).
+func attachLogFileToSentry(logFile *os.File) error {
+	content, err := keployLog.ReadLogFile(logFile)
 	if err != nil {
 		return fmt.Errorf("error reading log file: %s", err.Error())
 	}
@@ -482,7 +485,7 @@ func attachLogFileToSentry(logger *zap.Logger, logFilePath string) error {
 
 // HandleRecovery handles the common logic for recovering from a panic.
 func HandleRecovery(logger *zap.Logger, r interface{}, errMsg string) {
-	err := attachLogFileToSentry(logger, "./keploy-logs.txt")
+	err := attachLogFileToSentry(LogFile)
 	if err != nil {
 		LogError(logger, err, "failed to attach log file to sentry")
 	}
@@ -499,14 +502,17 @@ func Recover(logger *zap.Logger) {
 		fmt.Println(Emoji + "Failed to recover from panic. Logger is nil.")
 		return
 	}
-	sentry.Flush(2 * time.Second)
+	// No flush on a clean return: Recover is deferred on hot goroutines, and a
+	// flush waits on the process's one Sentry transport worker. Only a
+	// recovered panic has an event to flush (below).
 	if r := recover(); r != nil {
 		HandleRecovery(logger, r, "Recovered from panic")
+		// Before Stop: the process may exit as soon as the global context ends.
+		sentry.Flush(2 * time.Second)
 		err := Stop(logger, fmt.Sprintf("Recovered from: %s", r))
 		if err != nil {
 			LogError(logger, err, "failed to stop the global context")
 		}
-		sentry.Flush(2 * time.Second)
 	}
 }
 
@@ -559,8 +565,13 @@ func GetLatestGitHubRelease(ctx context.Context, logger *zap.Logger) (GitHubRele
 	repoOwner := "keploy"
 	repoName := "keploy"
 
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", repoOwner, repoName)
+	return getGitHubRelease(ctx, logger, fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", repoOwner, repoName))
+}
 
+// getGitHubRelease reads the release at apiURL. Anything but a 200 carrying a
+// tag is an error: a rate-limited answer decodes to an empty release, which
+// read as a version other than the running one -- an update to "".
+func getGitHubRelease(ctx context.Context, logger *zap.Logger, apiURL string) (GitHubRelease, error) {
 	client := http.Client{
 		Timeout: 4 * time.Second,
 	}
@@ -584,9 +595,15 @@ func GetLatestGitHubRelease(ctx context.Context, logger *zap.Logger) (GitHubRele
 		}
 	}()
 
+	if resp.StatusCode != http.StatusOK {
+		return GitHubRelease{}, fmt.Errorf("GitHub answered %s for %s", resp.Status, apiURL)
+	}
 	var release GitHubRelease
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
 		return GitHubRelease{}, err
+	}
+	if release.TagName == "" {
+		return GitHubRelease{}, fmt.Errorf("GitHub's answer for %s names no release", apiURL)
 	}
 	return release, nil
 }
@@ -675,18 +692,28 @@ func ExtractCommandFromArgs(args []string) string {
 	return ""
 }
 
-// FindDockerCmd checks if the cli is related to docker or not, it also returns if it is a docker compose file
+// FindDockerCmd checks if the cli is related to docker or not, it also returns if it is a docker compose file.
+//
+// Podman's spellings are the same kinds: its CLI takes Docker's run and start
+// flags, and `podman compose` runs a compose provider. Which engine a command
+// runs on is engine.Detect's to say; a build that cannot drive Podman refuses
+// the command (engine.Supported), rather than running it as a native process
+// that keploy would capture nothing from.
 func FindDockerCmd(cmd string) CmdType {
 	if cmd == "" {
 		return Empty
 	}
-	// Convert command to lowercase for case-insensitive comparison
-	cmdLower := strings.TrimSpace(strings.ToLower(cmd))
+	// Lowercased, and with its words joined by one space: `docker  run` and
+	// `docker<TAB>run` are `docker run` to the shell, and so to keploy.
+	cmdLower := strings.Join(strings.Fields(strings.ToLower(cmd)), " ")
 
 	// Define patterns for Docker and Docker Compose
-	dockerRunPatterns := []string{"docker run", "sudo docker run", "docker container run", "sudo docker container run"}
-	dockerStartPatterns := []string{"docker start", "sudo docker start", "docker container start", "sudo docker container start"}
-	dockerComposePatterns := []string{"docker-compose", "sudo docker-compose", "docker compose", "sudo docker compose"}
+	dockerRunPatterns := []string{"docker run", "sudo docker run", "docker container run", "sudo docker container run",
+		"podman run", "sudo podman run", "podman container run", "sudo podman container run"}
+	dockerStartPatterns := []string{"docker start", "sudo docker start", "docker container start", "sudo docker container start",
+		"podman start", "sudo podman start", "podman container start", "sudo podman container start"}
+	dockerComposePatterns := []string{"docker-compose", "sudo docker-compose", "docker compose", "sudo docker compose",
+		"podman-compose", "sudo podman-compose", "podman compose", "sudo podman compose"}
 
 	// Check for Docker Compose command patterns and file extensions
 	for _, pattern := range dockerComposePatterns {
@@ -707,6 +734,46 @@ func FindDockerCmd(cmd string) CmdType {
 		}
 	}
 	return Native
+}
+
+// RunSubcommandEnd is the offset in cmd just past the run subcommand of a
+// docker or podman (by base name), taken as `run` or `container run` right
+// after the engine word, where the flags for the container it starts go; -1
+// when there is none. A docker-named word without that after it (the value of
+// sudo's -u, a directory) is passed over.
+func RunSubcommandEnd(cmd string) int {
+	type word struct {
+		text string
+		end  int
+	}
+	var words []word
+	isSpace := func(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+	for i := 0; i < len(cmd); {
+		for i < len(cmd) && isSpace(cmd[i]) {
+			i++
+		}
+		from := i
+		for i < len(cmd) && !isSpace(cmd[i]) {
+			i++
+		}
+		if i > from {
+			words = append(words, word{cmd[from:i], i})
+		}
+	}
+	for i, w := range words {
+		base := strings.ToLower(w.text[strings.LastIndexAny(w.text, `/\`)+1:])
+		if base = strings.TrimSuffix(base, ".exe"); base != "docker" && base != "podman" {
+			continue
+		}
+		next := i + 1
+		if next < len(words) && strings.EqualFold(words[next].text, "container") {
+			next++
+		}
+		if next < len(words) && strings.EqualFold(words[next].text, "run") {
+			return words[next].end
+		}
+	}
+	return -1
 }
 
 type CmdType string
@@ -1021,7 +1088,7 @@ Get-ChildProcesses $parent | Select-Object ProcessId, ParentProcessId, Name | Fo
 	// Non-windows (existing logic)
 	logger.Debug("Interrupting process tree", zap.Int("pid", ppid), zap.String("signal", sig.String()))
 
-	children, err := findChildPIDs(ppid)
+	children, groupOf, err := findChildPIDs(ppid)
 	if err != nil {
 		return err
 	}
@@ -1030,7 +1097,7 @@ Get-ChildProcesses $parent | Select-Object ProcessId, ParentProcessId, Name | Fo
 
 	logger.Debug("Found child PIDs", zap.Ints("children", children))
 
-	uniqueProcess, err := uniqueProcessGroups(children)
+	uniqueProcess, err := uniqueProcessGroups(children, groupOf)
 	if err != nil {
 		logger.Error("failed to find unique process groups", zap.Int("pid", ppid), zap.Error(err))
 		uniqueProcess = children
@@ -1140,12 +1207,14 @@ func isProcessRunning(pid int) (bool, error) {
 	return true, nil
 }
 
-func uniqueProcessGroups(pids []int) ([]int, error) {
+// uniqueProcessGroups returns the process group of each of pids, as groupOf
+// reads it, each group once.
+func uniqueProcessGroups(pids []int, groupOf func(pid int) (int, error)) ([]int, error) {
 	uniqueGroups := make(map[int]bool)
 	var uniqueGPIDs []int
 
 	for _, pid := range pids {
-		pgid, err := getProcessGroupID(pid)
+		pgid, err := groupOf(pid)
 		if err != nil {
 			return nil, err
 		}
@@ -1156,89 +1225,6 @@ func uniqueProcessGroups(pids []int) ([]int, error) {
 	}
 
 	return uniqueGPIDs, nil
-}
-
-func getProcessGroupID(pid int) (int, error) {
-	statusPath := filepath.Join("/proc", strconv.Itoa(pid), "status")
-	statusBytes, err := os.ReadFile(statusPath)
-	if err != nil {
-		return 0, err
-	}
-
-	status := string(statusBytes)
-	for _, line := range strings.Split(status, "\n") {
-		if strings.HasPrefix(line, "NSpgid:") {
-			return extractIDFromStatusLine(line), nil
-		}
-	}
-
-	return 0, nil
-}
-
-// extractIDFromStatusLine extracts the ID from a status line in the format "Key:\tValue".
-func extractIDFromStatusLine(line string) int {
-	fields := strings.Fields(line)
-	if len(fields) == 2 {
-		id, err := strconv.Atoi(fields[1])
-		if err == nil {
-			return id
-		}
-	}
-	return -1
-}
-
-// findChildPIDs takes a parent PID and returns a slice of all descendant PIDs.
-func findChildPIDs(parentPID int) ([]int, error) {
-	var childPIDs []int
-
-	// Recursive helper function to find all descendants of a given PID.
-	var findDescendants func(int)
-	findDescendants = func(pid int) {
-		procDirs, err := os.ReadDir("/proc")
-		if err != nil {
-			return
-		}
-
-		for _, procDir := range procDirs {
-			if !procDir.IsDir() {
-				continue
-			}
-
-			childPid, err := strconv.Atoi(procDir.Name())
-			if err != nil {
-				continue
-			}
-
-			statusPath := filepath.Join("/proc", procDir.Name(), "status")
-			statusBytes, err := os.ReadFile(statusPath)
-			if err != nil {
-				continue
-			}
-
-			status := string(statusBytes)
-			for _, line := range strings.Split(status, "\n") {
-				if strings.HasPrefix(line, "PPid:") {
-					fields := strings.Fields(line)
-					if len(fields) == 2 {
-						ppid, err := strconv.Atoi(fields[1])
-						if err != nil {
-							break
-						}
-						if ppid == pid {
-							childPIDs = append(childPIDs, childPid)
-							findDescendants(childPid)
-						}
-					}
-					break
-				}
-			}
-		}
-	}
-
-	// Start the recursion with the initial parent PID.
-	findDescendants(parentPID)
-
-	return childPIDs, nil
 }
 
 // ephemeralPortRange reports the kernel's local port range and whether it could
@@ -1948,7 +1934,14 @@ func GetContainerIPv4() (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("could not find a non-loopback IP for the container")
+	// Tagged, so the agent that cannot start without it says so in its exit
+	// status: a container with no IPv4 address but loopback's (docker
+	// --network none, an IPv6-only network) is the environment to change, not
+	// a privilege to grant. Only an agent started with --is-docker asks (its
+	// hooks, as they load): they send the connections of the applications it
+	// serves to this address. A native one is reached over loopback and needs
+	// no address of its own.
+	return "", fmt.Errorf("%w: could not find a non-loopback IP for the container", ErrEnvironmentUnsupported)
 }
 
 // GetFullCommandUsed returns the full command-line used to run the current process.
